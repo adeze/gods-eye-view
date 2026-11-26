@@ -5,9 +5,15 @@
  * VIIRS header (confirmed live 2026-07-16):
  *   latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,satellite,
  *   instrument,confidence,version,bright_ti5,frp,daynight
+ * MODIS header:
+ *   latitude,longitude,brightness,scan,track,acq_date,acq_time,satellite,
+ *   instrument,confidence,version,bright_t31,frp,daynight
  *
  * Quirks this module owns:
- * - `confidence` is CATEGORICAL for VIIRS (`l`/`n`/`h`) — passed through raw.
+ * - `confidence` is CATEGORICAL for VIIRS (`l`/`n`/`h`) and numeric 0-100 for
+ *   MODIS — passed through raw.
+ * - Brightness maps from `bright_ti4`/`brightness`; the secondary band maps
+ *   from `bright_ti5`/`bright_t31`.
  * - `acq_time` is NOT zero-padded ("45" = 00:45 UTC) — kept as-is in records;
  *   {@link acquisitionMsUtc} does the padding.
  * - Upstream errors come back as HTML or plain text ("Invalid MAP_KEY"),
@@ -17,7 +23,14 @@
  */
 
 /** Header fields that must all be present for a payload to count as FIRMS CSV. */
-const REQUIRED_HEADER_FIELDS = ['latitude', 'longitude', 'acq_date', 'acq_time', 'confidence', 'frp'];
+const REQUIRED_HEADER_FIELDS = [
+  'latitude',
+  'longitude',
+  'acq_date',
+  'acq_time',
+  'confidence',
+  'frp',
+];
 
 const HOUR_MS = 3600_000;
 /** Trailing window size for {@link filterTrailing24h}. */
@@ -36,8 +49,10 @@ export function isLikelyCsv(text) {
   if (typeof text !== 'string') return false;
   const trimmed = text.trimStart();
   if (!trimmed || trimmed[0] === '<') return false;
-  const headerLine = trimmed.slice(0, trimmed.indexOf('\n') === -1 ? undefined : trimmed.indexOf('\n'))
-    .trim().toLowerCase();
+  const headerLine = trimmed
+    .slice(0, trimmed.indexOf('\n') === -1 ? undefined : trimmed.indexOf('\n'))
+    .trim()
+    .toLowerCase();
   const fields = headerLine.split(',').map((f) => f.trim());
   return REQUIRED_HEADER_FIELDS.every((required) => fields.includes(required));
 }
@@ -62,8 +77,13 @@ export function parseFirmsCsv(text) {
   // Locate the header (first non-empty line) and build a column index so the
   // parser survives column reordering across FIRMS product versions.
   let headerIndex = 0;
-  while (headerIndex < lines.length && !lines[headerIndex].trim()) headerIndex += 1;
-  const header = lines[headerIndex].trim().toLowerCase().split(',').map((f) => f.trim());
+  while (headerIndex < lines.length && !lines[headerIndex].trim())
+    headerIndex += 1;
+  const header = lines[headerIndex]
+    .trim()
+    .toLowerCase()
+    .split(',')
+    .map((f) => f.trim());
   const col = new Map(header.map((name, i) => [name, i]));
   const iLat = col.get('latitude');
   const iLon = col.get('longitude');
@@ -85,7 +105,17 @@ export function parseFirmsCsv(text) {
     if (parts.length < header.length) continue; // malformed row — skip
     const lat = Number(parts[iLat]);
     const lon = Number(parts[iLon]);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    // Blank or out-of-range positions are dropped, never read as 0 (see
+    // hasCoordinateValue in firmsAdapt.js for the proxy-record side).
+    if (
+      !parts[iLat].trim() ||
+      !parts[iLon].trim() ||
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lon) ||
+      Math.abs(lat) > 90 ||
+      Math.abs(lon) > 180
+    )
+      continue;
 
     records.push({
       lat,
@@ -114,7 +144,8 @@ export function parseFirmsCsv(text) {
  * @returns {number} Epoch ms, or NaN when unparseable.
  */
 export function acquisitionMsUtc(acqDate, acqTime) {
-  if (typeof acqDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(acqDate)) return NaN;
+  if (typeof acqDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(acqDate))
+    return NaN;
   const timeText = String(acqTime ?? '').trim();
   if (!/^\d{1,4}$/.test(timeText)) return NaN;
   const hhmm = timeText.padStart(4, '0');
@@ -123,8 +154,22 @@ export function acquisitionMsUtc(acqDate, acqTime) {
   const day = Number(acqDate.slice(8, 10));
   const hours = Number(hhmm.slice(0, 2));
   const minutes = Number(hhmm.slice(2, 4));
-  if (month < 1 || month > 12 || day < 1 || day > 31 || hours > 23 || minutes > 59) return NaN;
-  return Date.UTC(year, month - 1, day, hours, minutes);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hours > 23 ||
+    minutes > 59
+  )
+    return NaN;
+  const ms = Date.UTC(year, month - 1, day, hours, minutes);
+  const parsed = new Date(ms);
+  return parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+    ? ms
+    : NaN;
 }
 
 /**
@@ -137,19 +182,44 @@ export function acquisitionMsUtc(acqDate, acqTime) {
  * @returns {Array<Object>} Filtered records (original objects, order preserved).
  */
 export function filterTrailing24h(records, nowMs) {
-  if (!Array.isArray(records) || !Number.isFinite(nowMs)) return [];
+  return trailing24hWindow(records, nowMs).kept;
+}
+
+/**
+ * {@link filterTrailing24h} with the span of `nowMs` values, inclusive, over
+ * which it keeps exactly these records. A caller holding something built from
+ * `kept` can reuse it while its clock stays inside `from..until`.
+ * @param {Array<{acqDate: string, acqTime: string|number}>} records - Parser records.
+ * @param {number} nowMs - Reference epoch milliseconds.
+ * @returns {{kept: Array<Object>, from: number, until: number}} Span in epoch
+ *   ms; NaN (never reusable) for unusable input.
+ */
+export function trailing24hWindow(records, nowMs) {
+  if (!Array.isArray(records) || !Number.isFinite(nowMs))
+    return { kept: [], from: NaN, until: NaN };
   const oldest = nowMs - WINDOW_MS;
   const newest = nowMs + FORWARD_SLACK_MS;
+  let from = -Infinity;
+  let until = Infinity;
   const memo = new Map();
-  return records.filter((record) => {
+  const kept = records.filter((record) => {
     const key = `${record.acqDate}:${record.acqTime}`;
     let ms = memo.get(key);
     if (ms === undefined) {
       ms = acquisitionMsUtc(record.acqDate, record.acqTime);
       memo.set(key, ms);
+      // Each distinct time narrows the span to the clock values that leave
+      // it on the same side of the window.
+      if (ms < oldest) from = Math.max(from, ms + WINDOW_MS + 1);
+      else if (ms > newest) until = Math.min(until, ms - FORWARD_SLACK_MS - 1);
+      else if (Number.isFinite(ms)) {
+        from = Math.max(from, ms - FORWARD_SLACK_MS);
+        until = Math.min(until, ms + WINDOW_MS);
+      }
     }
     return Number.isFinite(ms) && ms >= oldest && ms <= newest;
   });
+  return { kept, from, until };
 }
 
 /** Trimmed string cell at index, '' for missing columns. */

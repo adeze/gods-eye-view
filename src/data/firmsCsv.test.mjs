@@ -9,15 +9,17 @@ import {
   filterTrailing24h,
   isLikelyCsv,
   parseFirmsCsv,
-} from './firmsCsv.js';
+  trailing24hWindow,
+} from 'gods-eye-view/sources/firms-csv';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = fs.readFileSync(
   path.join(__dirname, 'fixtures', 'firms-viirs-noaa20-sample.csv'),
-  'utf8'
+  'utf8',
 );
 
-const HEADER = 'latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,satellite,instrument,confidence,version,bright_ti5,frp,daynight';
+const HEADER =
+  'latitude,longitude,bright_ti4,scan,track,acq_date,acq_time,satellite,instrument,confidence,version,bright_ti5,frp,daynight';
 
 test('fixture parses to 45 records with finite lat/lon/frp', () => {
   const records = parseFirmsCsv(FIXTURE);
@@ -47,16 +49,44 @@ test('fixture first row maps every field, categorical confidence preserved raw',
   assert.equal(first.instrument, 'VIIRS');
 });
 
+test('MODIS schema maps fields and preserves numeric confidence raw', () => {
+  const header =
+    'latitude,longitude,brightness,scan,track,acq_date,acq_time,satellite,instrument,confidence,version,bright_t31,frp,daynight';
+  const row =
+    '34.123,-117.456,321.5,1.2,0.8,2026-07-16,1045,Aqua,MODIS,78,6.1NRT,290.25,12.4,D';
+  const [record] = parseFirmsCsv(`${header}\n${row}\n`);
+  assert.equal(record.lat, 34.123);
+  assert.equal(record.lon, -117.456);
+  assert.equal(record.frp, 12.4);
+  assert.equal(record.brightness, 321.5);
+  assert.equal(record.brightnessTi5, 290.25);
+  assert.equal(record.daynight, 'D');
+  assert.equal(record.acqDate, '2026-07-16');
+  assert.equal(record.acqTime, '1045');
+  assert.equal(record.satellite, 'Aqua');
+  assert.equal(record.instrument, 'MODIS');
+  assert.equal(record.confidence, '78');
+});
+
 test('acquisitionMsUtc: "1006" = 10:06 UTC', () => {
-  assert.equal(acquisitionMsUtc('2026-07-16', '1006'), Date.UTC(2026, 6, 16, 10, 6));
+  assert.equal(
+    acquisitionMsUtc('2026-07-16', '1006'),
+    Date.UTC(2026, 6, 16, 10, 6),
+  );
 });
 
 test('acquisitionMsUtc: non-zero-padded "45" = 00:45 UTC', () => {
-  assert.equal(acquisitionMsUtc('2026-07-16', '45'), Date.UTC(2026, 6, 16, 0, 45));
+  assert.equal(
+    acquisitionMsUtc('2026-07-16', '45'),
+    Date.UTC(2026, 6, 16, 0, 45),
+  );
 });
 
 test('acquisitionMsUtc: "0" = midnight UTC; garbage → NaN', () => {
-  assert.equal(acquisitionMsUtc('2026-07-16', '0'), Date.UTC(2026, 6, 16, 0, 0));
+  assert.equal(
+    acquisitionMsUtc('2026-07-16', '0'),
+    Date.UTC(2026, 6, 16, 0, 0),
+  );
   assert.ok(Number.isNaN(acquisitionMsUtc('not-a-date', '1006')));
   assert.ok(Number.isNaN(acquisitionMsUtc('2026-07-16', 'xx')));
 });
@@ -118,7 +148,12 @@ test('filterTrailing24h: window is [now − 24 h, now + 2 h] inclusive', () => {
   const kept = filterTrailing24h(records, now);
   assert.deepEqual(
     kept.map((r) => `${r.acqDate} ${r.acqTime}`),
-    ['2026-07-15 1200', '2026-07-15 1201', '2026-07-16 1130', '2026-07-16 1400']
+    [
+      '2026-07-15 1200',
+      '2026-07-15 1201',
+      '2026-07-16 1130',
+      '2026-07-16 1400',
+    ],
   );
 });
 
@@ -129,3 +164,65 @@ test('filterTrailing24h on the fixture keeps everything for a same-night now', (
   const kept = filterTrailing24h(records, Date.UTC(2026, 6, 17, 2, 0));
   assert.equal(kept.length, records.length);
 });
+
+test('trailing24hWindow spans the clock values that keep the same records', () => {
+  const now0 = Date.UTC(2026, 8, 11, 12);
+  const records = [
+    { acqDate: '2026-09-10', acqTime: '1205' },
+    { acqDate: '2026-09-10', acqTime: '1300' },
+    { acqDate: '2026-09-11', acqTime: '1100' },
+    { acqDate: '2026-09-11', acqTime: '1430' },
+    { acqDate: '2026-09-11', acqTime: '1600' },
+    { acqDate: 'bad-date', acqTime: '1006' },
+  ];
+  const edges = records
+    .map((r) => acquisitionMsUtc(r.acqDate, r.acqTime))
+    .filter(Number.isFinite)
+    .flatMap((ms) => [ms - 2 * 3600_000, ms + 24 * 3600_000]);
+  assert.equal(edges.length, 10);
+  const clocks = [now0, ...edges.flatMap((ms) => [ms - 1, ms, ms + 1])];
+  for (const now of clocks) {
+    const { kept, from, until } = trailing24hWindow(records, now);
+    assert.deepEqual(kept, filterTrailing24h(records, now));
+    assert.ok(from <= now && now <= until, 'the span holds its own clock');
+    for (const other of clocks) {
+      const then = filterTrailing24h(records, other);
+      const same =
+        then.length === kept.length && then.every((r, i) => r === kept[i]);
+      // Before the first record and after the last both keep nothing; the span covers one side.
+      const bothEmpty = then.length === 0 && kept.length === 0;
+      if (other >= from && other <= until)
+        assert.ok(same, `${other} is inside the span of ${now}`);
+      else
+        assert.ok(!same || bothEmpty, `${other} is outside the span of ${now}`);
+    }
+  }
+  assert.deepEqual(trailing24hWindow([], now0), {
+    kept: [],
+    from: -Infinity,
+    until: Infinity,
+  });
+  assert.deepEqual(trailing24hWindow(records, NaN), {
+    kept: [],
+    from: NaN,
+    until: NaN,
+  });
+});
+
+const contractCases = JSON.parse(
+  fs.readFileSync(
+    path.join(__dirname, 'fixtures', 'firms-csv-cases.json'),
+    'utf8',
+  ),
+);
+for (const fixture of contractCases) {
+  test(`portable FIRMS CSV contract: ${fixture.name}`, () => {
+    const records = parseFirmsCsv(fixture.csv);
+    assert.equal(records === null ? null : records.length, fixture.parsedCount);
+    const recent = filterTrailing24h(records, Date.parse(fixture.now));
+    assert.deepEqual(
+      recent.map((record) => record.acqTime),
+      fixture.recentTimes,
+    );
+  });
+}
